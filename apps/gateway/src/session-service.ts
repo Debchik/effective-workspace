@@ -54,6 +54,13 @@ function modeInstructions(mode: SessionMode): string {
   ].join('\n');
 }
 
+export class SessionBusyError extends Error {
+  constructor() {
+    super('Session is already running.');
+    this.name = 'SessionBusyError';
+  }
+}
+
 export class SessionService {
   constructor(
     private readonly store: Store,
@@ -142,66 +149,94 @@ export class SessionService {
       throw new Error('Session not found.');
     }
 
-    const effectiveText =
-      text.trim() || 'Please analyze the attached input.';
-    const userMessage = this.store.insertMessage(
-      session.id,
-      'user',
-      effectiveText
-    );
-
-    for (const upload of uploads) {
-      this.store.insertAttachment({
-        id: upload.id,
-        messageId: userMessage.id,
-        name: upload.originalName,
-        mimeType: upload.mimeType,
-        sizeBytes: upload.sizeBytes,
-        relativePath: upload.relativePath
-      });
+    if (!this.store.trySetSessionRunning(session.id)) {
+      throw new SessionBusyError();
     }
 
-    const runId = this.store.createRun(session.id, userMessage.id);
-    this.store.setSessionStatus(session.id, 'running');
-    this.store.audit(session.id, 'message.received', {
-      messageId: userMessage.id,
-      attachments: uploads.length
-    });
-
-    const nonImageFiles = uploads
-      .filter((item) => !item.mimeType.startsWith('image/'))
-      .map((item) => '- ' + item.relativePath)
-      .join('\n');
-
-    const prompt =
-      effectiveText +
-      (nonImageFiles
-        ? '\n\nAttached files available in the workspace:\n' +
-          nonImageFiles
-        : '');
+    let runId: string | null = null;
 
     try {
+      const effectiveText =
+        text.trim() || 'Please analyze the attached input.';
+      const userMessage = this.store.insertMessage(
+        session.id,
+        'user',
+        effectiveText
+      );
+
+      for (const upload of uploads) {
+        this.store.insertAttachment({
+          id: upload.id,
+          messageId: userMessage.id,
+          name: upload.originalName,
+          mimeType: upload.mimeType,
+          sizeBytes: upload.sizeBytes,
+          relativePath: upload.relativePath
+        });
+      }
+
+      runId = this.store.createRun(
+        session.id,
+        userMessage.id
+      );
+      this.store.audit(
+        session.id,
+        'message.received',
+        {
+          messageId: userMessage.id,
+          attachments: uploads.length
+        }
+      );
+
+      const nonImageFiles = uploads
+        .filter(
+          (item) =>
+            !item.mimeType.startsWith('image/')
+        )
+        .map(
+          (item) => '- ' + item.relativePath
+        )
+        .join('\n');
+
+      const prompt =
+        effectiveText +
+        (nonImageFiles
+          ? '\n\nAttached files available in the workspace:\n' +
+            nonImageFiles
+          : '');
+
       const result = await this.runtime.run({
         threadId: session.codexThreadId,
         workspaceDir: session.workspacePath,
         text: prompt,
         imagePaths: uploads
-          .filter((item) => item.mimeType.startsWith('image/'))
+          .filter((item) =>
+            item.mimeType.startsWith('image/')
+          )
           .map((item) => item.absolutePath)
       });
 
-      if (session.codexThreadId !== result.threadId) {
-        this.store.setCodexThreadId(session.id, result.threadId);
-        this.store.audit(session.id, 'runtime.thread_linked', {
-          threadId: result.threadId
-        });
+      if (
+        session.codexThreadId !==
+        result.threadId
+      ) {
+        this.store.setCodexThreadId(
+          session.id,
+          result.threadId
+        );
+        this.store.audit(
+          session.id,
+          'runtime.thread_linked',
+          { threadId: result.threadId }
+        );
       }
 
-      const assistantMessage = this.store.insertMessage(
-        session.id,
-        'assistant',
-        result.text
-      );
+      const assistantMessage =
+        this.store.insertMessage(
+          session.id,
+          'assistant',
+          result.text
+        );
 
       this.indexArtifacts(
         session.id,
@@ -209,25 +244,52 @@ export class SessionService {
         session.workspacePath
       );
 
-      this.store.finishRun(runId, 'completed', result.turnId);
-      this.store.setSessionStatus(session.id, 'idle');
-      this.store.audit(session.id, 'runtime.turn_completed', {
-        turnId: result.turnId
-      });
+      this.store.finishRun(
+        runId,
+        'completed',
+        result.turnId
+      );
+      this.store.setSessionStatus(
+        session.id,
+        'idle'
+      );
+      this.store.audit(
+        session.id,
+        'runtime.turn_completed',
+        { turnId: result.turnId }
+      );
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : String(error);
-      this.store.finishRun(runId, 'failed', undefined, message);
-      this.store.setSessionStatus(session.id, 'error');
-      this.store.audit(session.id, 'runtime.turn_failed', {
-        error: message
-      });
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      if (runId) {
+        this.store.finishRun(
+          runId,
+          'failed',
+          undefined,
+          message
+        );
+      }
+      this.store.setSessionStatus(
+        session.id,
+        'error'
+      );
+      this.store.audit(
+        session.id,
+        'runtime.turn_failed',
+        { error: message }
+      );
       throw error;
     }
 
-    const detail = this.store.getSessionDetail(session.id);
+    const detail =
+      this.store.getSessionDetail(session.id);
     if (!detail) {
-      throw new Error('Session disappeared after run.');
+      throw new Error(
+        'Session disappeared after run.'
+      );
     }
     return detail;
   }
@@ -244,13 +306,17 @@ export class SessionService {
     }
 
     const absolutePath = path.resolve(
-      session.workspacePath,
+      this.dataDir,
       artifact.relativePath
     );
-    const outputRoot =
-      path.resolve(session.workspacePath, 'output') + path.sep;
+    const artifactRoot =
+      path.resolve(
+        this.dataDir,
+        'artifacts',
+        session.id
+      ) + path.sep;
 
-    if (!absolutePath.startsWith(outputRoot)) return null;
+    if (!absolutePath.startsWith(artifactRoot)) return null;
     if (!fs.existsSync(absolutePath)) return null;
 
     return { record: artifact, absolutePath };
@@ -261,47 +327,107 @@ export class SessionService {
     messageId: string,
     workspacePath: string
   ): void {
-    const outputRoot = path.join(workspacePath, 'output');
+    const outputRoot = path.join(
+      workspacePath,
+      'output'
+    );
     if (!fs.existsSync(outputRoot)) return;
 
     const visit = (directory: string): void => {
-      for (const entry of fs.readdirSync(directory, {
-        withFileTypes: true
-      })) {
-        const absolutePath = path.join(directory, entry.name);
+      for (
+        const entry of fs.readdirSync(directory, {
+          withFileTypes: true
+        })
+      ) {
+        const sourcePath = path.join(
+          directory,
+          entry.name
+        );
 
         if (entry.isDirectory()) {
-          visit(absolutePath);
+          visit(sourcePath);
           continue;
         }
         if (!entry.isFile()) continue;
 
-        const stat = fs.statSync(absolutePath);
-        const relativePath = path.relative(
-          workspacePath,
-          absolutePath
+        const stat = fs.statSync(sourcePath);
+        const sourceRelativePath =
+          path.relative(
+            workspacePath,
+            sourcePath
+          );
+        const hash = sha256(sourcePath);
+
+        if (
+          this.store.findArtifactBySourceHash(
+            sessionId,
+            sourceRelativePath,
+            hash
+          )
+        ) {
+          continue;
+        }
+
+        const artifactId = randomUUID();
+        const artifactDirectory = path.join(
+          this.dataDir,
+          'artifacts',
+          sessionId,
+          artifactId
+        );
+        const archivedPath = path.join(
+          artifactDirectory,
+          safeName(entry.name)
         );
 
-        const artifact = this.store.insertArtifact({
-          sessionId,
-          messageId,
-          name: entry.name,
-          mimeType:
-            mime.lookup(entry.name) || 'application/octet-stream',
-          sizeBytes: stat.size,
-          relativePath,
-          sha256: sha256(absolutePath)
+        fs.mkdirSync(artifactDirectory, {
+          recursive: true
         });
+        fs.copyFileSync(
+          sourcePath,
+          archivedPath
+        );
 
-        if (artifact) {
-          this.store.audit(sessionId, 'artifact.indexed', {
-            artifactId: artifact.id,
-            relativePath
+        const relativePath = path.relative(
+          this.dataDir,
+          archivedPath
+        );
+
+        const artifact =
+          this.store.insertArtifact({
+            id: artifactId,
+            sessionId,
+            messageId,
+            name: entry.name,
+            mimeType:
+              mime.lookup(entry.name) ||
+              'application/octet-stream',
+            sizeBytes: stat.size,
+            sourceRelativePath,
+            relativePath,
+            sha256: hash
           });
+
+        if (!artifact) {
+          fs.rmSync(artifactDirectory, {
+            recursive: true,
+            force: true
+          });
+          continue;
         }
+
+        this.store.audit(
+          sessionId,
+          'artifact.indexed',
+          {
+            artifactId: artifact.id,
+            sourceRelativePath
+          }
+        );
       }
     };
 
     visit(outputRoot);
   }
+
 }
