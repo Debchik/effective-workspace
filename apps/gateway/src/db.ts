@@ -67,6 +67,10 @@ export class Store {
     ).run(timestamp);
   }
 
+  close(): void {
+    this.db.close();
+  }
+
   listSessions(): SessionRecord[] {
     const rows = this.db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC').all() as Row[];
     return rows.map((row) => this.mapSession(row));
