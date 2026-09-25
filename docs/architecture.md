@@ -72,7 +72,9 @@ Every session gets:
       inbox/
       output/
 
-inbox/ contains user uploads. output/ is the artifact contract: files placed there become downloadable from the UI.
+inbox/ contains user uploads. output/ is the agent-facing artifact contract.
+
+After a turn completes, new or changed files from output/ are copied into an immutable artifact store outside the Codex-writable workspace. The UI downloads those snapshots rather than the mutable working copy, so historical artifacts cannot silently change after later turns.
 
 Codex is started with the session directory as cwd. Turn sandbox policy grants writes only inside that workspace and restricts reads to the workspace plus macOS platform defaults. Network access is disabled in V0.1.
 
@@ -86,7 +88,7 @@ SQLite is the local source of truth for application metadata:
 - runs;
 - audit events.
 
-Large payloads stay on disk and the database stores paths, hashes, MIME types, and sizes.
+Large payloads stay on disk and the database stores paths, source paths, hashes, MIME types, and sizes. Artifact snapshots live under the gateway data directory, outside the session workspace.
 
 ## Why not store Codex history ourselves?
 
@@ -120,6 +122,7 @@ The gateway does not delete workspaces automatically.
 
 - Codex credentials never cross the gateway boundary.
 - A session may only access its own workspace.
-- Download endpoints resolve artifacts from database records; clients cannot request arbitrary paths.
+- Only one turn may be active for a session at a time.
+- Download endpoints resolve immutable artifact snapshots from database records; clients cannot request arbitrary paths.
 - All user-controlled filenames are sanitized and stored with generated prefixes.
 - Network access from the Codex sandbox is off by default.
