@@ -26,6 +26,7 @@ export class Store {
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.migrate();
+    this.recoverInterruptedRuns();
   }
 
   private migrate(): void {
@@ -42,8 +43,8 @@ export class Store {
       "CREATE TABLE IF NOT EXISTS artifacts (" +
         "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, " +
         "message_id TEXT REFERENCES messages(id) ON DELETE SET NULL, name TEXT NOT NULL, mime_type TEXT NOT NULL, " +
-        "size_bytes INTEGER NOT NULL, relative_path TEXT NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL, " +
-        "UNIQUE(session_id, relative_path, sha256));" +
+        "size_bytes INTEGER NOT NULL, source_relative_path TEXT NOT NULL, relative_path TEXT NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL, " +
+        "UNIQUE(session_id, source_relative_path, sha256));" +
       "CREATE TABLE IF NOT EXISTS runs (" +
         "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, " +
         "user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, status TEXT NOT NULL, " +
@@ -54,6 +55,16 @@ export class Store {
       "CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at);" +
       "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, created_at);"
     );
+  }
+
+  private recoverInterruptedRuns(): void {
+    const timestamp = now();
+    this.db.prepare(
+      "UPDATE runs SET status = 'failed', error = ?, completed_at = ? WHERE status = 'running'"
+    ).run('Gateway restarted before the run completed.', timestamp);
+    this.db.prepare(
+      "UPDATE sessions SET status = 'error', updated_at = ? WHERE status = 'running'"
+    ).run(timestamp);
   }
 
   listSessions(): SessionRecord[] {
@@ -105,6 +116,13 @@ export class Store {
     ).run(status, now(), id);
   }
 
+  trySetSessionRunning(id: string): boolean {
+    const result = this.db.prepare(
+      "UPDATE sessions SET status = 'running', updated_at = ? WHERE id = ? AND status != 'running'"
+    ).run(now(), id);
+    return Number(result.changes) === 1;
+  }
+
   setCodexThreadId(id: string, threadId: string): void {
     this.db.prepare(
       'UPDATE sessions SET codex_thread_id = ?, updated_at = ? WHERE id = ?'
@@ -148,25 +166,27 @@ export class Store {
   }
 
   insertArtifact(input: {
+    id: string;
     sessionId: string;
     messageId: string | null;
     name: string;
     mimeType: string;
     sizeBytes: number;
+    sourceRelativePath: string;
     relativePath: string;
     sha256: string;
   }): ArtifactRecord | null {
-    const id = randomUUID();
     try {
       this.db.prepare(
-        'INSERT INTO artifacts (id, session_id, message_id, name, mime_type, size_bytes, relative_path, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO artifacts (id, session_id, message_id, name, mime_type, size_bytes, source_relative_path, relative_path, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
       ).run(
-        id,
+        input.id,
         input.sessionId,
         input.messageId,
         input.name,
         input.mimeType,
         input.sizeBytes,
+        input.sourceRelativePath,
         input.relativePath,
         input.sha256,
         now()
@@ -174,7 +194,18 @@ export class Store {
     } catch {
       return null;
     }
-    return this.getArtifact(id);
+    return this.getArtifact(input.id);
+  }
+
+  findArtifactBySourceHash(
+    sessionId: string,
+    sourceRelativePath: string,
+    hash: string
+  ): ArtifactRecord | null {
+    const row = this.db.prepare(
+      'SELECT * FROM artifacts WHERE session_id = ? AND source_relative_path = ? AND sha256 = ? LIMIT 1'
+    ).get(sessionId, sourceRelativePath, hash) as Row | undefined;
+    return row ? this.mapArtifact(row) : null;
   }
 
   getArtifact(id: string): ArtifactRecord | null {
@@ -271,6 +302,7 @@ export class Store {
       name: String(row.name),
       mimeType: String(row.mime_type),
       sizeBytes: Number(row.size_bytes),
+      sourceRelativePath: String(row.source_relative_path),
       relativePath: String(row.relative_path),
       sha256: String(row.sha256),
       createdAt: String(row.created_at)
