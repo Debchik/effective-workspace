@@ -241,6 +241,7 @@ export async function buildServer(config: AppConfig) {
 
   app.addHook('onClose', async () => {
     await runtime.close();
+    store.close();
   });
 
   return app;
