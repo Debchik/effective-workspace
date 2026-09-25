@@ -11,7 +11,10 @@ import {
   MockRuntime,
   type AgentRuntime
 } from './runtime.js';
-import { SessionService } from './session-service.js';
+import {
+  SessionBusyError,
+  SessionService
+} from './session-service.js';
 import type { SavedUpload, SessionMode } from './types.js';
 
 function tokenMatches(header: string | undefined, expectedToken: string): boolean {
@@ -124,9 +127,15 @@ export async function buildServer(config: AppConfig) {
     async (request, reply) => {
       const { id } = request.params as { id: string };
 
-      if (!service.getSession(id)) {
+      const existing = service.getSession(id);
+      if (!existing) {
         return reply.code(404).send({
           error: 'Session not found'
+        });
+      }
+      if (existing.status === 'running') {
+        return reply.code(409).send({
+          error: 'Session is already running'
         });
       }
 
@@ -162,7 +171,11 @@ export async function buildServer(config: AppConfig) {
         );
       } catch (error) {
         request.log.error(error);
-        return reply.code(502).send({
+        const statusCode =
+          error instanceof SessionBusyError
+            ? 409
+            : 502;
+        return reply.code(statusCode).send({
           error:
             error instanceof Error
               ? error.message
