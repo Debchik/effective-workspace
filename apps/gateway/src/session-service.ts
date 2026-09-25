@@ -164,51 +164,79 @@ export class SessionService {
       throw new SessionBusyError();
     }
 
-    const effectiveText =
-      text.trim() || 'Please analyze the attached input.';
-    const userMessage = this.store.insertMessage(
-      session.id,
-      'user',
-      effectiveText
-    );
+    let runId: string | null = null;
 
-    for (const upload of uploads) {
-      this.store.insertAttachment({
-        id: upload.id,
-        messageId: userMessage.id,
-        name: upload.originalName,
-        mimeType: upload.mimeType,
-        sizeBytes: upload.sizeBytes,
-        relativePath: upload.relativePath
-      });
-    }
+    try {
+      const effectiveText =
+        text.trim() || 'Please analyze the attached input.';
+      const userMessage = this.store.insertMessage(
+        session.id,
+        'user',
+        effectiveText
+      );
 
-    const runId = this.store.createRun(
-      session.id,
-      userMessage.id
-    );
-    this.store.audit(
-      session.id,
-      'message.received',
-      {
-        messageId: userMessage.id,
-        runId,
-        attachments: uploads.length
+      for (const upload of uploads) {
+        this.store.insertAttachment({
+          id: upload.id,
+          messageId: userMessage.id,
+          name: upload.originalName,
+          mimeType: upload.mimeType,
+          sizeBytes: upload.sizeBytes,
+          relativePath: upload.relativePath
+        });
       }
-    );
 
-    const completion = this.completeRun({
-      session,
-      runId,
-      effectiveText,
-      uploads
-    });
+      runId = this.store.createRun(
+        session.id,
+        userMessage.id
+      );
+      this.store.audit(
+        session.id,
+        'message.received',
+        {
+          messageId: userMessage.id,
+          runId,
+          attachments: uploads.length
+        }
+      );
 
-    return {
-      runId,
-      sessionId: session.id,
-      completion
-    };
+      const completion = this.completeRun({
+        session,
+        runId,
+        effectiveText,
+        uploads
+      });
+
+      return {
+        runId,
+        sessionId: session.id,
+        completion
+      };
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      if (runId) {
+        this.store.finishRun(
+          runId,
+          'failed',
+          undefined,
+          message
+        );
+      }
+      this.store.setSessionStatus(
+        session.id,
+        'error'
+      );
+      this.store.audit(
+        session.id,
+        'run.start_failed',
+        { runId, error: message }
+      );
+      throw error;
+    }
   }
 
   async sendMessage(
