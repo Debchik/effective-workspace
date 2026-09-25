@@ -29,6 +29,7 @@ export type ArtifactRecord = {
   name: string;
   mimeType: string;
   sizeBytes: number;
+  sourceRelativePath: string;
   relativePath: string;
   sha256: string;
   createdAt: string;
