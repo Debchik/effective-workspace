@@ -9,6 +9,7 @@ import { Store } from './db.js';
 import type { AgentRuntime } from './runtime.js';
 import type {
   ArtifactRecord,
+  RunRecord,
   SavedUpload,
   SessionDetail,
   SessionMode,
@@ -61,6 +62,12 @@ export class SessionBusyError extends Error {
   }
 }
 
+export type StartedRun = {
+  runId: string;
+  sessionId: string;
+  completion: Promise<SessionDetail>;
+};
+
 export class SessionService {
   constructor(
     private readonly store: Store,
@@ -74,6 +81,10 @@ export class SessionService {
 
   getSession(id: string): SessionDetail | null {
     return this.store.getSessionDetail(id);
+  }
+
+  getRun(id: string): RunRecord | null {
+    return this.store.getRun(id);
   }
 
   createSession(input: {
@@ -139,11 +150,11 @@ export class SessionService {
     };
   }
 
-  async sendMessage(
+  startMessage(
     sessionId: string,
     text: string,
     uploads: SavedUpload[]
-  ): Promise<SessionDetail> {
+  ): StartedRun {
     const session = this.store.getSession(sessionId);
     if (!session) {
       throw new Error('Session not found.');
@@ -153,41 +164,79 @@ export class SessionService {
       throw new SessionBusyError();
     }
 
-    let runId: string | null = null;
+    const effectiveText =
+      text.trim() || 'Please analyze the attached input.';
+    const userMessage = this.store.insertMessage(
+      session.id,
+      'user',
+      effectiveText
+    );
+
+    for (const upload of uploads) {
+      this.store.insertAttachment({
+        id: upload.id,
+        messageId: userMessage.id,
+        name: upload.originalName,
+        mimeType: upload.mimeType,
+        sizeBytes: upload.sizeBytes,
+        relativePath: upload.relativePath
+      });
+    }
+
+    const runId = this.store.createRun(
+      session.id,
+      userMessage.id
+    );
+    this.store.audit(
+      session.id,
+      'message.received',
+      {
+        messageId: userMessage.id,
+        runId,
+        attachments: uploads.length
+      }
+    );
+
+    const completion = this.completeRun({
+      session,
+      runId,
+      effectiveText,
+      uploads
+    });
+
+    return {
+      runId,
+      sessionId: session.id,
+      completion
+    };
+  }
+
+  async sendMessage(
+    sessionId: string,
+    text: string,
+    uploads: SavedUpload[]
+  ): Promise<SessionDetail> {
+    return this.startMessage(
+      sessionId,
+      text,
+      uploads
+    ).completion;
+  }
+
+  private async completeRun(input: {
+    session: SessionRecord;
+    runId: string;
+    effectiveText: string;
+    uploads: SavedUpload[];
+  }): Promise<SessionDetail> {
+    const {
+      session,
+      runId,
+      effectiveText,
+      uploads
+    } = input;
 
     try {
-      const effectiveText =
-        text.trim() || 'Please analyze the attached input.';
-      const userMessage = this.store.insertMessage(
-        session.id,
-        'user',
-        effectiveText
-      );
-
-      for (const upload of uploads) {
-        this.store.insertAttachment({
-          id: upload.id,
-          messageId: userMessage.id,
-          name: upload.originalName,
-          mimeType: upload.mimeType,
-          sizeBytes: upload.sizeBytes,
-          relativePath: upload.relativePath
-        });
-      }
-
-      runId = this.store.createRun(
-        session.id,
-        userMessage.id
-      );
-      this.store.audit(
-        session.id,
-        'message.received',
-        {
-          messageId: userMessage.id,
-          attachments: uploads.length
-        }
-      );
-
       const nonImageFiles = uploads
         .filter(
           (item) =>
@@ -256,7 +305,7 @@ export class SessionService {
       this.store.audit(
         session.id,
         'runtime.turn_completed',
-        { turnId: result.turnId }
+        { runId, turnId: result.turnId }
       );
     } catch (error) {
       const message =
@@ -264,14 +313,12 @@ export class SessionService {
           ? error.message
           : String(error);
 
-      if (runId) {
-        this.store.finishRun(
-          runId,
-          'failed',
-          undefined,
-          message
-        );
-      }
+      this.store.finishRun(
+        runId,
+        'failed',
+        undefined,
+        message
+      );
       this.store.setSessionStatus(
         session.id,
         'error'
@@ -279,7 +326,7 @@ export class SessionService {
       this.store.audit(
         session.id,
         'runtime.turn_failed',
-        { error: message }
+        { runId, error: message }
       );
       throw error;
     }
@@ -429,5 +476,4 @@ export class SessionService {
 
     visit(outputRoot);
   }
-
 }

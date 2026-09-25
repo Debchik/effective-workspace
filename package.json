@@ -4,11 +4,14 @@
   "packageManager": "pnpm@10.17.1",
   "engines": { "node": ">=24" },
   "scripts": {
+    "bootstrap": "bash ./scripts/bootstrap.sh",
     "dev": "concurrently -n gateway,web -c auto \"pnpm --filter @effective-workspace/gateway dev\" \"pnpm --filter @effective-workspace/web dev\"",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm --filter @effective-workspace/gateway test",
-    "start": "pnpm --filter @effective-workspace/gateway start"
+    "db:init": "pnpm --filter @effective-workspace/gateway db:init",
+    "start": "pnpm --filter @effective-workspace/gateway start",
+    "start:remote": "bash ./scripts/start.sh"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

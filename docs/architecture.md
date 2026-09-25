@@ -2,56 +2,136 @@
 
 ## Goal
 
-Replace manual screenshot and messenger shuttling with a small self-hosted gateway. The browser is a thin client. The personal Mac owns credentials, Codex state, storage, and workspaces.
+Replace manual screenshot and messenger shuttling with a small self-hosted gateway. The work Mac only needs a browser. The personal Mac owns Codex credentials, agent state, local storage, workspaces, and artifacts.
 
-## Boundaries
+## Deployment topology
 
-### Web client
+```text
+Work Mac
+  Browser
+    |
+    | static assets
+    v
+GitHub Pages
+    |
+    | HTTPS / WSS
+    v
+Cloudflare edge
+    |
+    | Cloudflare Tunnel
+    v
+cloudflared on personal Mac
+    |
+    v
+Fastify Gateway on 127.0.0.1:8787
+    |
+    +--> SQLite
+    +--> SessionService
+    +--> AgentRuntime
+           |
+           v
+       Codex app-server
+```
+
+GitHub Pages is not a proxy. It only serves the React bundle.
+
+`cloudflared` creates the outbound connection from the personal Mac to Cloudflare. No public IP, router port forwarding, or gateway bind to `0.0.0.0` is required.
+
+## Web client
 
 Responsibilities:
+
+- store the gateway URL separately from the static frontend location;
 - authenticate with the gateway access token;
 - create and select sessions;
 - send text and attachments;
 - paste screenshots directly from the clipboard;
 - render conversation history;
-- download generated artifacts.
+- download generated artifacts;
+- keep an authenticated WebSocket to `/api/events`;
+- reload persisted state after event reconnects.
 
-It never talks to Codex directly and never receives Codex credentials.
+The client never talks to Codex directly and never receives Codex credentials.
 
-### HTTP gateway
+## HTTP gateway
 
 Fastify is the stable application boundary for browser clients and future native helpers.
 
-The REST API is intentionally independent from Codex:
-- GET /api/sessions
-- POST /api/sessions
-- GET /api/sessions/:id
-- POST /api/sessions/:id/messages
-- GET /api/sessions/:id/artifacts/:artifactId
-- GET /api/runtime/account
+REST API:
 
-Future Mac helpers can use the same API without changing the agent runtime.
+- `GET /api/sessions`
+- `POST /api/sessions`
+- `GET /api/sessions/:id`
+- `POST /api/sessions/:id/messages`
+- `GET /api/runs/:id`
+- `GET /api/sessions/:id/artifacts/:artifactId`
+- `GET /api/runtime/account`
 
-### Session service
+Realtime API:
+
+- `WS /api/events`
+
+The API is intentionally independent from Codex protocol details.
+
+## Why runs are asynchronous
+
+A Codex turn can exceed a reverse proxy's normal HTTP read timeout. Keeping the browser's message POST open until Codex finishes makes completion depend on that network connection.
+
+The gateway therefore uses two phases.
+
+### Submission
+
+```text
+POST message
+  -> validate/authenticate
+  -> save uploads
+  -> atomically mark session running
+  -> persist user message
+  -> create run row
+  -> start local Codex work
+  -> HTTP 202 { runId }
+```
+
+At this point the durable local state already contains the user message and run identifier.
+
+### Completion
+
+```text
+Codex turn/completed
+  -> persist assistant message
+  -> snapshot artifacts
+  -> finish run
+  -> set session idle
+  -> emit run.completed over WebSocket
+```
+
+A failure similarly persists the failed run and emits `run.failed`.
+
+WebSocket events improve latency/UX but are not the source of truth. If an event is missed, the browser reloads the session from SQLite after reconnecting.
+
+## Session service
 
 The service coordinates one user turn:
-1. persist the user message;
-2. persist attachments inside the session workspace;
-3. mark the session and run as running;
+
+1. acquire the per-session running lock;
+2. persist the user message and attachments;
+3. create the local run ID;
 4. start or resume the Codex thread;
 5. send text plus local image inputs;
-6. wait for turn completion;
+6. wait locally for Codex completion;
 7. persist the assistant response;
-8. index files from output/ as artifacts;
-9. write audit events.
+8. index files from `output/` as artifacts;
+9. finish the run and update session status;
+10. write audit events.
 
-This layer depends on the AgentRuntime interface, not on JSON-RPC.
+`startMessage()` exposes the run ID before the asynchronous completion promise resolves. The legacy `sendMessage()` helper awaits the same operation and remains useful for tests/internal callers.
 
-### Agent runtime
+## Agent runtime
 
 V0.1 implements Codex app-server over stdio.
 
 The runtime owns:
+
 - one long-lived local app-server child process;
 - JSON-RPC request correlation;
 - the initialize handshake;
@@ -61,26 +141,31 @@ The runtime owns:
 - final assistant response extraction;
 - account inspection.
 
-Each application session stores the Codex thread id. This makes application sessions durable across gateway restarts.
+Each application session stores the Codex thread ID. This makes application sessions durable across gateway restarts.
 
-### Workspace
+The `AgentRuntime` boundary allows later replacement/addition of another runtime without changing HTTP/UI semantics.
+
+## Workspace
 
 Every session gets:
 
-    sessions/<session-id>/
-      AGENTS.md
-      inbox/
-      output/
+```text
+sessions/<session-id>/
+  AGENTS.md
+  inbox/
+  output/
+```
 
-inbox/ contains user uploads. output/ is the agent-facing artifact contract.
+`inbox/` contains user uploads. `output/` is the agent-facing artifact contract.
 
-After a turn completes, new or changed files from output/ are copied into an immutable artifact store outside the Codex-writable workspace. The UI downloads those snapshots rather than the mutable working copy, so historical artifacts cannot silently change after later turns.
+After a turn completes, new or changed files from `output/` are copied into an immutable artifact store outside the Codex-writable workspace. Historical downloads therefore do not silently change after later turns.
 
-Codex is started with the session directory as cwd. Turn sandbox policy grants writes only inside that workspace and restricts reads to the workspace plus macOS platform defaults. Network access is disabled in V0.1.
+Codex starts with the session directory as cwd. Turn sandbox policy grants writes only inside that workspace and restricts reads to the workspace plus macOS platform defaults. Network access is disabled in V0.1.
 
-### Storage
+## Storage
 
-SQLite is the local source of truth for application metadata:
+SQLite on the personal Mac is the source of truth:
+
 - sessions;
 - messages;
 - attachments;
@@ -88,41 +173,83 @@ SQLite is the local source of truth for application metadata:
 - runs;
 - audit events.
 
-Large payloads stay on disk and the database stores paths, source paths, hashes, MIME types, and sizes. Artifact snapshots live under the gateway data directory, outside the session workspace.
+Large payloads stay on local disk. The database stores paths, source paths, hashes, MIME types, sizes, and run state.
 
-## Why not store Codex history ourselves?
+No cloud database is required.
 
-Codex app-server already persists thread history. Effective Workspace stores the thread id plus its own user-facing message log.
+For one user and one gateway process, SQLite avoids an unnecessary service boundary. A future storage interface can move metadata to PostgreSQL when multi-worker or multi-user coordination justifies it.
 
-This separation lets us:
-- resume native Codex context;
-- render a stable application history;
-- migrate runtimes later;
-- keep an explicit audit trail.
+## Realtime channel
+
+The browser connects to `/api/events` over WebSocket.
+
+Because browser WebSocket APIs cannot attach arbitrary Authorization headers, authentication is performed as the first WebSocket message. The gateway:
+
+1. validates the request Origin against the same allowlist used for HTTP;
+2. requires the gateway token within five seconds;
+3. adds the socket to the event fan-out only after authentication;
+4. sends WebSocket ping frames periodically as keepalive;
+5. removes the socket on close/error.
+
+The gateway token is never placed in a URL.
+
+## Cloudflare modes
+
+### Quick Tunnel
+
+`cloudflared tunnel --url http://127.0.0.1:8787`
+
+Used by default for a completely free setup with no domain. The URL is temporary.
+
+### Named Tunnel
+
+The bootstrap can create a locally managed named tunnel and a DNS route for an existing Cloudflare-managed domain. The generated local config routes only the chosen hostname to the gateway and ends with a 404 catch-all.
 
 ## Failure model
 
-A run moves through running -> completed or failed.
+A run moves through:
 
-User input is persisted before the agent starts. If Codex fails, the session remains recoverable and the next request can retry against the same thread.
+```text
+running -> completed
+        \-> failed
+```
 
-The gateway does not delete workspaces automatically.
+User input and the run row exist before the agent starts.
 
-## V0.2 extension points
+If Codex fails:
 
-1. Streaming: expose app-server notifications through SSE or WebSocket while keeping the REST mutation endpoint.
-2. Approvals: map app-server approval requests to persisted approval records and UI actions.
-3. Auth: replace the shared bearer token with OIDC without touching SessionService.
-4. Mac helper: use the same REST API for clipboard and screenshot capture.
-5. Redaction: add an InputTransform chain before RuntimeInput is created.
-6. Work executor: introduce a separate Executor interface rather than giving the gateway arbitrary local-machine access.
-7. Multi-user: add owner_id to domain tables and allocate workspace/runtime identity per owner.
+- run becomes `failed`;
+- session becomes `error`;
+- error is audited;
+- browser receives `run.failed` if connected.
+
+If the gateway process dies during a run, startup recovery marks leftover running rows failed and the session error.
+
+If the WebSocket dies, the run continues locally. Realtime reconnect is independent from execution.
+
+If the browser closes, the run continues locally.
+
+## Extension points
+
+1. Token streaming: forward Codex deltas over the existing WebSocket.
+2. Cancellation: persist cancel requests and map them to Codex turn interruption.
+3. Approvals: persist app-server approval requests and UI decisions.
+4. Auth: replace the shared bearer token with OIDC without touching SessionService.
+5. Mac helper: use the same API for clipboard and screenshot capture.
+6. Redaction: add an InputTransform chain before RuntimeInput is created.
+7. Work executor: introduce a separate Executor trust boundary.
+8. Storage: replace SQLite behind a Store interface if distributed coordination becomes necessary.
+9. Multi-user: add owner IDs and isolate runtime/workspace identity per user.
 
 ## Main invariants
 
 - Codex credentials never cross the gateway boundary.
-- A session may only access its own workspace.
-- Only one turn may be active for a session at a time.
-- Download endpoints resolve immutable artifact snapshots from database records; clients cannot request arbitrary paths.
-- All user-controlled filenames are sanitized and stored with generated prefixes.
+- Gateway remains bound to localhost for the Cloudflare deployment.
+- Cloudflare connectivity is outbound-only from the host.
+- A session may access only its own workspace.
+- Only one Codex turn may be active for a session.
+- A run is persisted before asynchronous execution is exposed to the client.
+- WebSocket delivery is an optimization; SQLite is authoritative.
+- Download endpoints resolve immutable artifact snapshots from database records.
+- User-controlled filenames are sanitized and stored with generated prefixes.
 - Network access from the Codex sandbox is off by default.

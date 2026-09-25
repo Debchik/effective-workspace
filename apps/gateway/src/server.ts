@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
+import websocket from '@fastify/websocket';
+import type { WebSocket } from 'ws';
 import type { AppConfig } from './config.js';
 import { Store } from './db.js';
 import {
@@ -17,15 +20,42 @@ import {
 } from './session-service.js';
 import type { SavedUpload, SessionMode } from './types.js';
 
-function tokenMatches(header: string | undefined, expectedToken: string): boolean {
-  if (!header?.startsWith('Bearer ')) return false;
+function secretMatches(actualValue: string | undefined, expectedValue: string): boolean {
+  if (!actualValue) return false;
 
-  const actual = Buffer.from(header.slice('Bearer '.length));
-  const expected = Buffer.from(expectedToken);
+  const actual = Buffer.from(actualValue);
+  const expected = Buffer.from(expectedValue);
   if (actual.length !== expected.length) return false;
 
   return timingSafeEqual(actual, expected);
 }
+
+function bearerTokenMatches(header: string | undefined, expectedToken: string): boolean {
+  if (!header?.startsWith('Bearer ')) return false;
+  return secretMatches(header.slice('Bearer '.length), expectedToken);
+}
+
+function normalizeOrigin(origin: string): string {
+  return origin.trim().replace(/\/$/, '');
+}
+
+function originAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {
+  if (!origin) return true;
+  return allowedOrigins.includes(normalizeOrigin(origin));
+}
+
+type GatewayEvent =
+  | {
+      type: 'run.completed';
+      runId: string;
+      sessionId: string;
+    }
+  | {
+      type: 'run.failed';
+      runId: string;
+      sessionId: string;
+      error: string;
+    };
 
 export async function buildServer(config: AppConfig) {
   fs.mkdirSync(config.dataDir, { recursive: true });
@@ -51,6 +81,26 @@ export async function buildServer(config: AppConfig) {
     bodyLimit: 30 * 1024 * 1024
   });
 
+  await app.register(websocket, {
+    options: {
+      maxPayload: 64 * 1024
+    }
+  });
+
+  await app.register(cors, {
+    origin(origin, callback) {
+      callback(
+        null,
+        originAllowed(origin, config.allowedOrigins)
+      );
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: [
+      'authorization',
+      'content-type'
+    ]
+  });
+
   await app.register(multipart, {
     limits: {
       files: 10,
@@ -59,12 +109,25 @@ export async function buildServer(config: AppConfig) {
     }
   });
 
+  const eventClients = new Set<WebSocket>();
+
+  function broadcast(event: GatewayEvent): void {
+    const payload = JSON.stringify(event);
+    for (const client of eventClients) {
+      if (client.readyState === 1) {
+        client.send(payload);
+      }
+    }
+  }
+
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/')) return;
+    if (request.method === 'OPTIONS') return;
     if (request.url === '/api/health') return;
+    if (request.url.startsWith('/api/events')) return;
 
     if (
-      !tokenMatches(
+      !bearerTokenMatches(
         request.headers.authorization,
         config.accessToken
       )
@@ -73,9 +136,72 @@ export async function buildServer(config: AppConfig) {
     }
   });
 
+  app.get(
+    '/api/events',
+    { websocket: true },
+    (socket, request) => {
+      let authenticated = false;
+
+      const cleanup = (): void => {
+        clearTimeout(authTimeout);
+        clearInterval(heartbeat);
+        eventClients.delete(socket);
+      };
+
+      const authTimeout = setTimeout(() => {
+        if (!authenticated) {
+          socket.close(1008, 'Authentication required');
+        }
+      }, 5_000);
+
+      const heartbeat = setInterval(() => {
+        if (authenticated && socket.readyState === 1) {
+          socket.ping();
+        }
+      }, 30_000);
+
+      socket.on('message', (raw) => {
+        if (authenticated) return;
+
+        try {
+          const payload = JSON.parse(raw.toString()) as {
+            type?: string;
+            token?: string;
+          };
+
+          if (
+            payload.type !== 'auth' ||
+            !secretMatches(
+              payload.token,
+              config.accessToken
+            ) ||
+            !originAllowed(
+              request.headers.origin,
+              config.allowedOrigins
+            )
+          ) {
+            socket.close(1008, 'Unauthorized');
+            return;
+          }
+
+          authenticated = true;
+          clearTimeout(authTimeout);
+          eventClients.add(socket);
+          socket.send(JSON.stringify({ type: 'ready' }));
+        } catch {
+          socket.close(1003, 'Invalid message');
+        }
+      });
+
+      socket.on('close', cleanup);
+      socket.on('error', cleanup);
+    }
+  );
+
   app.get('/api/health', async () => ({
     ok: true,
-    runtime: config.runtime
+    runtime: config.runtime,
+    events: 'websocket'
   }));
 
   app.get('/api/runtime/account', async () => {
@@ -122,6 +248,19 @@ export async function buildServer(config: AppConfig) {
     return session;
   });
 
+  app.get('/api/runs/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = service.getRun(id);
+
+    if (!run) {
+      return reply.code(404).send({
+        error: 'Run not found'
+      });
+    }
+
+    return run;
+  });
+
   app.post(
     '/api/sessions/:id/messages',
     async (request, reply) => {
@@ -164,11 +303,37 @@ export async function buildServer(config: AppConfig) {
           });
         }
 
-        return await service.sendMessage(
+        const started = service.startMessage(
           id,
           text,
           uploads
         );
+
+        void started.completion
+          .then(() => {
+            broadcast({
+              type: 'run.completed',
+              runId: started.runId,
+              sessionId: started.sessionId
+            });
+          })
+          .catch((error: unknown) => {
+            broadcast({
+              type: 'run.failed',
+              runId: started.runId,
+              sessionId: started.sessionId,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : String(error)
+            });
+          });
+
+        return reply.code(202).send({
+          runId: started.runId,
+          sessionId: started.sessionId,
+          status: 'running'
+        });
       } catch (error) {
         request.log.error(error);
         const statusCode =
@@ -240,6 +405,10 @@ export async function buildServer(config: AppConfig) {
   }
 
   app.addHook('onClose', async () => {
+    for (const client of eventClients) {
+      client.close(1001, 'Gateway shutting down');
+    }
+    eventClients.clear();
     await runtime.close();
     store.close();
   });

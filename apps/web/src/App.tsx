@@ -1,6 +1,6 @@
 import {
   useEffect,
-  useMemo,
+  useRef,
   useState,
   type ClipboardEvent
 } from 'react';
@@ -42,7 +42,29 @@ type Session = {
   messages?: Message[];
 };
 
+type GatewayEvent =
+  | { type: 'ready' }
+  | {
+      type: 'run.completed';
+      runId: string;
+      sessionId: string;
+    }
+  | {
+      type: 'run.failed';
+      runId: string;
+      sessionId: string;
+      error: string;
+    };
+
+function normalizeGatewayUrl(value: string): string {
+  return value.trim().replace(/\/+$/, '');
+}
+
 function App() {
+  const [gatewayUrl, setGatewayUrl] = useState(
+    () => localStorage.getItem('ew-gateway-url') || ''
+  );
+  const [gatewayDraft, setGatewayDraft] = useState(gatewayUrl);
   const [token, setToken] = useState(
     () => localStorage.getItem('ew-token') || ''
   );
@@ -50,22 +72,24 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedId, setSelectedId] =
     useState<string | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
   const [selected, setSelected] =
     useState<Session | null>(null);
   const [text, setText] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  const [eventsConnected, setEventsConnected] =
+    useState(false);
   const [error, setError] = useState('');
 
-  const authHeaders = useMemo(
-    () => ({ Authorization: 'Bearer ' + token }),
-    [token]
-  );
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   useEffect(() => {
     if (!token) return;
     void refreshSessions();
-  }, [token]);
+  }, [token, gatewayUrl]);
 
   useEffect(() => {
     if (!token || !selectedId) {
@@ -73,7 +97,100 @@ function App() {
       return;
     }
     void loadSession(selectedId);
-  }, [token, selectedId]);
+  }, [token, gatewayUrl, selectedId]);
+
+  useEffect(() => {
+    if (!token) return;
+
+    let stopped = false;
+    let retryTimer: number | undefined;
+    let socket: WebSocket | null = null;
+
+    const connect = (): void => {
+      const base = gatewayUrl || window.location.origin;
+      const url = new URL('/api/events', base);
+      url.protocol =
+        url.protocol === 'https:' ? 'wss:' : 'ws:';
+
+      socket = new WebSocket(url);
+
+      socket.onopen = () => {
+        socket?.send(
+          JSON.stringify({
+            type: 'auth',
+            token
+          })
+        );
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(
+            String(event.data)
+          ) as GatewayEvent;
+
+          if (payload.type === 'ready') {
+            setEventsConnected(true);
+            void refreshSessions();
+            const current = selectedIdRef.current;
+            if (current) {
+              void loadSession(current);
+            }
+            return;
+          }
+
+          if (
+            payload.type === 'run.completed' ||
+            payload.type === 'run.failed'
+          ) {
+            if (payload.type === 'run.failed') {
+              setError(payload.error);
+            }
+
+            if (
+              selectedIdRef.current ===
+              payload.sessionId
+            ) {
+              void loadSession(payload.sessionId);
+            }
+            void refreshSessions();
+          }
+        } catch {
+          setError('Invalid gateway event received.');
+        }
+      };
+
+      socket.onclose = () => {
+        setEventsConnected(false);
+        if (!stopped) {
+          retryTimer = window.setTimeout(
+            connect,
+            2_000
+          );
+        }
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      setEventsConnected(false);
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+      }
+      socket?.close();
+    };
+  }, [token, gatewayUrl]);
+
+  function endpointUrl(endpoint: string): string {
+    const base = normalizeGatewayUrl(gatewayUrl);
+    return base ? base + endpoint : endpoint;
+  }
 
   async function api(
     endpoint: string,
@@ -85,10 +202,13 @@ function App() {
       'Bearer ' + token
     );
 
-    const response = await fetch(endpoint, {
-      ...options,
-      headers
-    });
+    const response = await fetch(
+      endpointUrl(endpoint),
+      {
+        ...options,
+        headers
+      }
+    );
 
     if (response.status === 401) {
       setToken('');
@@ -114,7 +234,7 @@ function App() {
       const data = await response.json();
       setSessions(data.sessions);
 
-      if (!selectedId && data.sessions[0]) {
+      if (!selectedIdRef.current && data.sessions[0]) {
         setSelectedId(data.sessions[0].id);
       }
     } catch (err) {
@@ -131,7 +251,9 @@ function App() {
       const response = await api(
         '/api/sessions/' + id
       );
-      setSelected(await response.json());
+      const detail = await response.json() as Session;
+      setSelected(detail);
+      setBusy(detail.status === 'running');
     } catch (err) {
       setError(
         err instanceof Error
@@ -186,7 +308,7 @@ function App() {
     }
 
     try {
-      const response = await api(
+      await api(
         '/api/sessions/' +
           selectedId +
           '/messages',
@@ -196,20 +318,18 @@ function App() {
         }
       );
 
-      const detail = await response.json();
-      setSelected(detail);
       setText('');
       setFiles([]);
+      await loadSession(selectedId);
       await refreshSessions();
     } catch (err) {
+      setBusy(false);
       setError(
         err instanceof Error
           ? err.message
           : String(err)
       );
       await loadSession(selectedId);
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -237,36 +357,88 @@ function App() {
   ): Promise<void> {
     if (!selectedId) return;
 
-    const response = await fetch(
-      '/api/sessions/' +
-        selectedId +
-        '/artifacts/' +
-        artifact.id,
-      { headers: authHeaders }
+    try {
+      const response = await api(
+        '/api/sessions/' +
+          selectedId +
+          '/artifacts/' +
+          artifact.id
+      );
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor =
+        document.createElement('a');
+
+      anchor.href = url;
+      anchor.download = artifact.name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Artifact download failed.'
+      );
+    }
+  }
+
+  function connect(): void {
+    const normalized = normalizeGatewayUrl(
+      gatewayDraft
     );
 
-    if (!response.ok) {
-      setError('Artifact download failed.');
+    if (
+      normalized &&
+      !/^https?:\/\//.test(normalized)
+    ) {
+      setError(
+        'Gateway URL must start with http:// or https://.'
+      );
       return;
     }
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor =
-      document.createElement('a');
+    if (
+      !normalized &&
+      window.location.hostname.endsWith(
+        '.github.io'
+      )
+    ) {
+      setError(
+        'Enter the Cloudflare gateway URL.'
+      );
+      return;
+    }
 
-    anchor.href = url;
-    anchor.download = artifact.name;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    if (tokenDraft.trim().length < 24) {
+      setError('Enter the gateway access token.');
+      return;
+    }
+
+    localStorage.setItem(
+      'ew-gateway-url',
+      normalized
+    );
+    localStorage.setItem(
+      'ew-token',
+      tokenDraft.trim()
+    );
+
+    setError('');
+    setGatewayUrl(normalized);
+    setToken(tokenDraft.trim());
   }
 
   function disconnect(): void {
     localStorage.removeItem('ew-token');
+    localStorage.removeItem('ew-gateway-url');
     setToken('');
+    setGatewayUrl('');
+    setGatewayDraft('');
     setSessions([]);
     setSelectedId(null);
     setSelected(null);
+    setBusy(false);
   }
 
   if (!token) {
@@ -278,9 +450,19 @@ function App() {
           </div>
           <h1>Connect to your gateway</h1>
           <p>
-            Enter the access token configured on
-            the personal Mac.
+            Enter the Cloudflare Tunnel URL and the
+            access token configured on the personal Mac.
+            For local development, the gateway URL may
+            be left blank.
           </p>
+          <input
+            type="url"
+            value={gatewayDraft}
+            onChange={(event) =>
+              setGatewayDraft(event.target.value)
+            }
+            placeholder="https://your-tunnel.example.com"
+          />
           <input
             type="password"
             value={tokenDraft}
@@ -289,21 +471,21 @@ function App() {
             }
             placeholder="Gateway access token"
           />
-          <button
-            onClick={() => {
-              localStorage.setItem(
-                'ew-token',
-                tokenDraft
-              );
-              setToken(tokenDraft);
-            }}
-          >
+          <button onClick={connect}>
             Connect
           </button>
+          {error && (
+            <div className="error">
+              {error}
+            </div>
+          )}
         </section>
       </main>
     );
   }
+
+  const isRunning =
+    busy || selected?.status === 'running';
 
   return (
     <main className="app-shell">
@@ -313,6 +495,9 @@ function App() {
             Effective Workspace
           </div>
           <h2>Sessions</h2>
+          <small>
+            events: {eventsConnected ? 'connected' : 'reconnecting'}
+          </small>
         </div>
 
         <div className="new-buttons">
@@ -381,7 +566,7 @@ function App() {
                   'status ' + selected.status
                 }
               >
-                {busy
+                {isRunning
                   ? 'running'
                   : selected.status}
               </span>
@@ -521,10 +706,10 @@ function App() {
                 </label>
 
                 <button
-                  disabled={busy}
+                  disabled={isRunning}
                   onClick={() => void send()}
                 >
-                  {busy ? 'Running…' : 'Send'}
+                  {isRunning ? 'Running…' : 'Send'}
                 </button>
               </div>
 

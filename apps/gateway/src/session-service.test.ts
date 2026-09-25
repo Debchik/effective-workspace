@@ -207,6 +207,53 @@ test(
 );
 
 test(
+  'exposes a durable run id before a long turn completes',
+  async () => {
+    const runtime = new BlockingRuntime();
+    const fixture = createFixture(runtime);
+
+    try {
+      const session =
+        fixture.service.createSession({
+          mode: 'analysis'
+        });
+
+      const started =
+        fixture.service.startMessage(
+          session.id,
+          'long analysis',
+          []
+        );
+
+      const running =
+        fixture.service.getRun(started.runId);
+      assert.equal(running?.status, 'running');
+      assert.equal(
+        fixture.service.getSession(session.id)
+          ?.status,
+        'running'
+      );
+
+      runtime.release();
+      await started.completion;
+
+      const completed =
+        fixture.service.getRun(started.runId);
+      assert.equal(
+        completed?.status,
+        'completed'
+      );
+      assert.equal(
+        completed?.codexTurnId,
+        'blocking-turn'
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  }
+);
+
+test(
   'rejects a concurrent turn for the same session',
   async () => {
     const runtime = new BlockingRuntime();

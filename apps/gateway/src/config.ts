@@ -5,6 +5,7 @@ export type AppConfig = {
   port: number;
   dataDir: string;
   accessToken: string;
+  allowedOrigins: string[];
   runtime: 'codex' | 'mock';
   codexBin: string;
   codexModel?: string;
@@ -22,11 +23,17 @@ export function loadConfig(): AppConfig {
     throw new Error('RUNTIME must be either codex or mock.');
   }
 
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
   return {
     host: process.env.HOST?.trim() || '127.0.0.1',
     port: Number(process.env.PORT || 8787),
     dataDir: path.resolve(process.cwd(), process.env.DATA_DIR?.trim() || '../../.data'),
     accessToken,
+    allowedOrigins,
     runtime: runtimeValue,
     codexBin: process.env.CODEX_BIN?.trim() || 'codex',
     codexModel: process.env.CODEX_MODEL?.trim() || undefined,

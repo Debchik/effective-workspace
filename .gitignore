@@ -2,6 +2,7 @@ node_modules
 dist
 .env
 .data
+.cloudflared
 .DS_Store
 *.log
 apps/web/dist

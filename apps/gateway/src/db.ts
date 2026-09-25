@@ -6,6 +6,7 @@ import type {
   ArtifactRecord,
   AttachmentRecord,
   MessageRecord,
+  RunRecord,
   SessionDetail,
   SessionMode,
   SessionRecord,
@@ -53,6 +54,7 @@ export class Store {
         "id TEXT PRIMARY KEY, session_id TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at TEXT NOT NULL);" +
       "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);" +
       "CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at);" +
+      "CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at);" +
       "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, created_at);"
     );
   }
@@ -225,6 +227,13 @@ export class Store {
     return id;
   }
 
+  getRun(id: string): RunRecord | null {
+    const row = this.db.prepare(
+      'SELECT * FROM runs WHERE id = ?'
+    ).get(id) as Row | undefined;
+    return row ? this.mapRun(row) : null;
+  }
+
   finishRun(
     id: string,
     status: 'completed' | 'failed',
@@ -310,6 +319,19 @@ export class Store {
       relativePath: String(row.relative_path),
       sha256: String(row.sha256),
       createdAt: String(row.created_at)
+    };
+  }
+
+  private mapRun(row: Row): RunRecord {
+    return {
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      userMessageId: String(row.user_message_id),
+      status: row.status as RunRecord['status'],
+      codexTurnId: row.codex_turn_id ? String(row.codex_turn_id) : null,
+      error: row.error ? String(row.error) : null,
+      startedAt: String(row.started_at),
+      completedAt: row.completed_at ? String(row.completed_at) : null
     };
   }
 }

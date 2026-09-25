@@ -1,5 +1,6 @@
 export type SessionMode = 'code' | 'analysis';
 export type SessionStatus = 'idle' | 'running' | 'error';
+export type RunStatus = 'running' | 'completed' | 'failed';
 
 export type SessionRecord = {
   id: string;
@@ -43,6 +44,17 @@ export type MessageRecord = {
   createdAt: string;
   attachments: AttachmentRecord[];
   artifacts: ArtifactRecord[];
+};
+
+export type RunRecord = {
+  id: string;
+  sessionId: string;
+  userMessageId: string;
+  status: RunStatus;
+  codexTurnId: string | null;
+  error: string | null;
+  startedAt: string;
+  completedAt: string | null;
 };
 
 export type SessionDetail = SessionRecord & {
