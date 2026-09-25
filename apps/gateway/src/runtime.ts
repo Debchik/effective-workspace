@@ -156,7 +156,7 @@ export class CodexAppServerRuntime implements AgentRuntime {
 
       return {
         threadId,
-        turnId: done.turnId || expectedTurnId,
+        turnId: done.turnId || expectedTurnId || '',
         text: finalText || streamedText || 'Codex completed without a text response.'
       };
     } finally {
