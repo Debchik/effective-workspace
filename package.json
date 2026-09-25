@@ -7,6 +7,7 @@
     "dev": "concurrently -n gateway,web -c auto \"pnpm --filter @effective-workspace/gateway dev\" \"pnpm --filter @effective-workspace/web dev\"",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @effective-workspace/gateway test",
     "start": "pnpm --filter @effective-workspace/gateway start"
   },
   "devDependencies": {
