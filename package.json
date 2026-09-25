@@ -1,0 +1,16 @@
+{
+  "name": "effective-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.17.1",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "concurrently -n gateway,web -c auto \"pnpm --filter @effective-workspace/gateway dev\" \"pnpm --filter @effective-workspace/web dev\"",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "start": "pnpm --filter @effective-workspace/gateway start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2"
+  }
+}
